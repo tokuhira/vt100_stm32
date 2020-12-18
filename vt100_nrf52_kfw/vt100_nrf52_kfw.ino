@@ -2,10 +2,11 @@
   vt100_nrf52_kfw.ino - VT100 Terminal Emulator for Arduino
   Copyright (c) 2018 Hideaki Tominaga. All rights reserved.
 
-  Original: for Arduino STM32 and PS/2 Keyboard (@ht-deko)
-  Modified: for Adafruit nRF52 with Keyboard FeatherWing (@tokuhira)
+  Original: for Arduino STM32 and PS/2 Keyboard (github.com/ht-deko)
+  Modified: for Adafruit nRF52 with Keyboard FeatherWing (github.com/tokuhira)
 */
 
+#include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>         // Core graphics library
@@ -36,8 +37,8 @@
 #define SD_CS        27 // 普通のFeatherの場合は 5
 
 // ターミナルUART用ピン
-#define SW_RXD       13 // 普通のFeatherの場合は 8 (nRF52832 は USB Serial 直結)
-#define SW_TXD       14 // 普通のFeatherの場合は 6 (nRF52832 は USB Serial 直結)
+#define SW_RXD       16 // 普通のFeatherの場合は 8 (nRF52832 は USB Serial 直結)
+#define SW_TXD       20 // 普通のFeatherの場合は 6 (nRF52832 は USB Serial 直結)
 
 // NeoPixel制御用ピン
 #define NEOPIXEL_PIN  7 // 普通のFeatherの場合は 11
@@ -67,9 +68,12 @@ Adafruit_STMPE610 ts(STMPE_CS);
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
 Adafruit_NeoPixel pixels(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 BBQ10Keyboard keyboard; // I2C で用いるピンはライブラリ内で定義
-//SoftwareSerial Serial3(SW_RXD, SW_TXD);
-#define Serial3 Serial // とりあえず Arduino のシリアルモニタとつないでおく
-File root;
+SoftwareSerial Serial3(SW_RXD, SW_TXD);
+File root; // SDカード用
+SoftwareTimer blinkTimer; // http://www.freertos.org/RTOS-software-timer.html
+
+// カーソルの点滅周期
+#define BLINK_TIMER_MS 250 // ミリ秒
 
 // タッチパネルのキャリブレーション値
 #define TS_MINX 150
@@ -1347,41 +1351,17 @@ void unknownSequence(em m, char c) {
 // -----------------------------------------------------------------------------
 
 // タイマーハンドラ
-// https://tech.144lab.com/entry/nrf52-arduino
-// 上記ブロクをメモのため書き写しただけの状態 (呼んでない)
-extern "C" void TIMER2_IRQHandler(void) {
-  if ((NRF_TIMER2->EVENTS_COMPARE[0] != 0) &&
-      ((NRF_TIMER2->INTENSET & TIMER_INTENSET_COMPARE0_Msk) != 0)) {
-    NRF_TIMER2->EVENTS_COMPARE[0] = 0;  // Clear compare register 0 event
-  }
+void handle_timer(TimerHandle_t xTimerID)
+{
+  (void) xTimerID; // freeRTOS timer ID, ignored if not used
   canShowCursor = true;
-}
-void startTimer(unsigned long us) {
-  NRF_TIMER2->TASKS_STOP = 1;
-  NRF_TIMER2->MODE = TIMER_MODE_MODE_Timer;  // Set the timer in Counter Mode
-  NRF_TIMER2->TASKS_CLEAR = 1;  // clear the task first to be usable for later
-  NRF_TIMER2->PRESCALER = 4;    // Set prescaler. Higher number gives slower
-                                // timer.
-  NRF_TIMER2->BITMODE = TIMER_BITMODE_BITMODE_32Bit
-                        << TIMER_BITMODE_BITMODE_Pos;
-  NRF_TIMER2->CC[0] = us;  // Set value for TIMER2 compare register 0
-
-  // Enable interrupt on Timer 2, both for CC[0] and CC[1] compare match events
-  NRF_TIMER2->INTENSET = TIMER_INTENSET_COMPARE0_Enabled
-                         << TIMER_INTENSET_COMPARE0_Pos;
-  // Clear the timer when COMPARE0 event is triggered
-  NRF_TIMER2->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Enabled
-                       << TIMER_SHORTS_COMPARE0_CLEAR_Pos;
-
-  NRF_TIMER2->TASKS_START = 1;  // Start TIMER
-  NVIC_EnableIRQ(TIMER2_IRQn);
 }
 
 // 後でSD上のファイルを使うときのためのメモ (呼んでない)
 void checkSD() {
   const bool sd = SD.begin(SD_CS);
   if (sd) {
-    Serial.print("SD Card contents:\n");
+    Serial.print(F("SD Card contents:\n"));
     root = SD.open("/");
     
     while (true) {
@@ -1402,8 +1382,8 @@ void setup() {
   Wire.begin();
   keyboard.begin();
   keyboard.setBacklight(KBD_BACKLIGHT);
-  Serial.begin(DEFAULT_BAUDRATE /* 115200 */);
-  //Serial3.begin(DEFAULT_BAUDRATE);
+  Serial.begin(115200);
+  Serial3.begin(DEFAULT_BAUDRATE);
 
   // タッチスクリーン、NeoPixel の初期化
   ts.begin();
@@ -1432,7 +1412,8 @@ void setup() {
   //checkSD();
 
   // カーソル用タイマーの設定
-  //startTimer(250000); // 250ms
+  blinkTimer.begin(BLINK_TIMER_MS, handle_timer);
+  blinkTimer.start();
 }
 
 // ループ
@@ -1446,12 +1427,12 @@ void loop() {
     p.y = map(p.y, TS_MINX, TS_MAXX, 0, tft.width());
     
     // カーソルジャンプは未実装
-    //Serial.print("Touch: x=");
-    //Serial.print(p.x);
-    //Serial.print(", y=");
-    //Serial.println(p.y);
-    //
-    //needCursorUpdate = true;
+    Serial.print(F("Touch: x="));
+    Serial.print(p.x);
+    Serial.print(F(", y="));
+    Serial.println(p.y);
+    
+    needCursorUpdate = true;
   }
 
   // キーボード入力処理 (通信相手への出力)
